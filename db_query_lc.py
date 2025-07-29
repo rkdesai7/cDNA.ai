@@ -115,7 +115,7 @@ def index_fasta(text, organism, update_hmm):
         ])
 
     os.remove(fasta_path)
-    return "✅ Indexed successfully."
+    return "Indexed successfully."
 
 # --- LangGraph ---
 def build_graph():
@@ -146,7 +146,7 @@ def build_graph():
 
 # --- Streamlit UI ---
 st.set_page_config(page_title="Biochat Assistant", layout="wide")
-st.title("🧬 Kozak Sequence Assistant")
+st.title("Kozak Sequence Assistant")
 
 with st.sidebar:
     st.header("📤 Upload FASTA")
@@ -158,7 +158,7 @@ with st.sidebar:
         message = index_fasta(text, organism, update_hmm)
         st.success(message)
 
-st.subheader("💬 Ask a Question or Prediction")
+st.subheader("Ask a Question or Prediction")
 org = st.text_input("Filter by Organism", value="E_coli")
 prompt = st.text_area("Your Question", height=150)
 submit = st.button("Submit")
@@ -167,7 +167,7 @@ if submit and prompt:
     graph = build_graph()
     state = {"question": prompt, "organism": org}
     result = graph.invoke(state)
-    st.markdown("### 🧠 LLM Answer")
+    st.markdown("### LLM Answer")
     st.success(result["response"])
 
     st.markdown("### 🔍 Posterior Probability Plots")
