@@ -1,31 +1,46 @@
 import os
 import json
 import gzip
+import subprocess
+import tempfile
 import pinecone
+import streamlit as st
+import matplotlib.pyplot as plt
 from sentence_transformers import SentenceTransformer
 from langchain.vectorstores import Pinecone as LC_Pinecone
 from langchain.embeddings import SentenceTransformerEmbeddings
 from langchain.chat_models import ChatOpenAI
 from langchain.prompts import PromptTemplate
-from langchain_core.runnables import RunnableLambda, RunnableMap, RunnablePassthrough
+from langchain_core.runnables import RunnableLambda
 from langchain_core.runnables.graph import StateGraph
 from langchain_core.output_parsers import StrOutputParser
 
-### CONFIG ###
+# --- CONFIG ---
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") or "YOUR_PINECONE_API_KEY"
 PINECONE_ENV = os.getenv("PINECONE_ENV") or "YOUR_REGION"
 INDEX_NAME = "dna-hmm-kozak"
-LLM_MODEL = "gpt-4o"
 MODEL_NAME = "all-MiniLM-L6-v2"
+LLM_MODEL = "gpt-4o"
 
 pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENV)
 index = pinecone.Index(INDEX_NAME)
 
-embedding_model = SentenceTransformer(model_name=MODEL_NAME)
-vectorstore = LC_Pinecone(index, embedding_model.encode, "text")
-llm = ChatOpenAI(model_name=LLM_MODEL)
+@st.cache_resource(show_spinner=False)
+def get_embedding_model():
+    return SentenceTransformer(MODEL_NAME)
 
-### Prompt Template ###
+@st.cache_resource(show_spinner=False)
+def get_vectorstore():
+    return LC_Pinecone(index, get_embedding_model().encode, "text")
+
+@st.cache_resource(show_spinner=False)
+def get_llm():
+    return ChatOpenAI(model_name=LLM_MODEL)
+
+embedding_model = get_embedding_model()
+vectorstore = get_vectorstore()
+llm = get_llm()
+
 prompt_template = PromptTemplate.from_template("""
 You are a helpful bioinformatics assistant. You have access to DNA sequences, their forward–backward HMM posterior probabilities for Kozak/not‑Kozak states, and annotated consensus Kozak regions.
 
@@ -34,40 +49,62 @@ You are a helpful bioinformatics assistant. You have access to DNA sequences, th
 {question}
 """)
 
-output_parser = StrOutputParser()
-
-### FASTA Parser ###
-def parse_fasta(fasta_path):
-    with open(fasta_path, "r") as f:
-        header = None
-        seq = []
-        for line in f:
-            line = line.strip()
-            if line.startswith(">"):
-                if header:
-                    yield (header, ''.join(seq))
-                header = line[1:]
-                seq = []
-            else:
-                seq.append(line)
-        if header:
-            yield (header, ''.join(seq))
-
-### Compression ###
-def decode_posterior(blob):
-    return json.loads(gzip.decompress(blob).decode("utf-8"))
+# --- UTILS ---
+def parse_fasta(text):
+    lines = text.splitlines()
+    header, seq = None, []
+    for line in lines:
+        line = line.strip()
+        if line.startswith(">"):
+            if header:
+                yield (header, ''.join(seq))
+            header = line[1:]
+            seq = []
+        else:
+            seq.append(line)
+    if header:
+        yield (header, ''.join(seq))
 
 def encode_posterior(array):
     return gzip.compress(json.dumps(array).encode("utf-8"))
 
-### Indexing Function ###
-def index_fasta(fasta_path, organism="unknown"):
-    for seq_id, sequence in parse_fasta(fasta_path):
+def decode_posterior(blob):
+    return json.loads(gzip.decompress(blob).decode("utf-8"))
+
+def generate_hmm_model(fasta_path, organism):
+    os.makedirs("models", exist_ok=True)
+    output = f"models/model_{organism}.json"
+    subprocess.run(["python", "gen_HMM.py", "--input", fasta_path, "--output", output], check=True)
+    return output
+
+def run_forward_backward(seq, model_path):
+    with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix=".fa") as f:
+        f.write(f">query\n{seq}\n")
+        fasta_path = f.name
+    result = subprocess.run(
+        ["python", "forward_backward.py", "--input", fasta_path, "--model", model_path],
+        capture_output=True, text=True
+    )
+    os.remove(fasta_path)
+    if result.returncode != 0:
+        raise RuntimeError(f"HMM failed: {result.stderr}")
+    data = json.loads(result.stdout)
+    return data["posterior"], data.get("consensus", [])
+
+def index_fasta(text, organism, update_hmm):
+    with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix=".fa") as f:
+        f.write(text)
+        fasta_path = f.name
+
+    if update_hmm or not os.path.exists(f"models/model_{organism}.json"):
+        hmm_model_path = generate_hmm_model(fasta_path, organism)
+    else:
+        hmm_model_path = f"models/model_{organism}.json"
+
+    for seq_id, sequence in parse_fasta(text.splitlines()):
+        posterior, consensus = run_forward_backward(sequence, hmm_model_path)
         summary = f"Sequence {seq_id} from {organism}: {sequence[:20]}..."
         vector = embedding_model.encode(summary).tolist()
-        posterior = [[0.8, 0.2]] * len(sequence)  # MOCK POSTERIOR
-        consensus = [[5, 12]]                    # MOCK KOZAK REGION
-
         index.upsert([
             (f"{organism}_{seq_id}", vector, {
                 "sequence": sequence,
@@ -76,24 +113,18 @@ def index_fasta(fasta_path, organism="unknown"):
                 "consensus_kozak": json.dumps(consensus)
             })
         ])
-    print(f"✅ Indexed sequences from {fasta_path}")
 
-### Prediction Detection ###
-def detect_prediction(user_input):
-    lowered = user_input.lower()
-    if "predict" in lowered and "sequence:" in lowered:
-        parts = user_input.split("sequence:")
-        return parts[-1].strip()
-    return None
+    os.remove(fasta_path)
+    return "✅ Indexed successfully."
 
-### LangGraph Definition ###
+# --- LangGraph ---
 def build_graph():
     def retrieve_fn(state):
         query = state["question"]
         filter_ = {"organism": state["organism"]} if state.get("organism") else None
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 15, "filter": filter_})
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 10, "filter": filter_})
         docs = retriever.get_relevant_documents(query)
-        context = "\n\n".join(d.page_content if hasattr(d, "page_content") else str(d.metadata) for d in docs)
+        context = "\n\n".join(str(d.metadata) for d in docs)
         return {"context": context, **state}
 
     def prompt_fn(state):
@@ -107,46 +138,52 @@ def build_graph():
     graph.add_node("retrieve", RunnableLambda(retrieve_fn))
     graph.add_node("prompt", RunnableLambda(prompt_fn))
     graph.add_node("llm", RunnableLambda(llm_fn))
-
     graph.set_entry_point("retrieve")
     graph.add_edge("retrieve", "prompt")
     graph.add_edge("prompt", "llm")
     graph.set_finish_point("llm")
-
     return graph.compile()
 
-### Run Loop ###
-graph = build_graph()
+# --- Streamlit UI ---
+st.set_page_config(page_title="Biochat Assistant", layout="wide")
+st.title("🧬 Kozak Sequence Assistant")
 
-print("\nBioinformatics Assistant with LangGraph (type 'exit' to quit, or 'upload <path>' to index a FASTA file)")
-while True:
-    user_input = input("\nPrompt: ")
-    if user_input.strip().lower() in {"exit", "quit"}:
-        print("Exiting.")
-        break
+with st.sidebar:
+    st.header("📤 Upload FASTA")
+    uploaded_file = st.file_uploader("Upload .fa file", type=["fa", "fasta"])
+    organism = st.text_input("Organism", value="E_coli")
+    update_hmm = st.checkbox("Regenerate HMM model", value=False)
+    if uploaded_file and st.button("Index Sequences"):
+        text = uploaded_file.read().decode()
+        message = index_fasta(text, organism, update_hmm)
+        st.success(message)
 
-    if user_input.lower().startswith("upload"):
-        _, file_path = user_input.split(maxsplit=1)
-        organism = input("Organism name: ").strip()
-        if os.path.exists(file_path):
-            index_fasta(file_path, organism=organism)
-        else:
-            print("[!] File not found.")
-        continue
+st.subheader("💬 Ask a Question or Prediction")
+org = st.text_input("Filter by Organism", value="E_coli")
+prompt = st.text_area("Your Question", height=150)
+submit = st.button("Submit")
 
-    organism = input("Organism filter (or leave blank): ").strip()
-    new_sequence = detect_prediction(user_input)
-    if new_sequence:
-        question = f"Here is a new sequence from {organism or 'unknown'}:\n{new_sequence}\n\nBased on the records above, predict the Kozak region(s) and explain."
-    else:
-        question = user_input
+if submit and prompt:
+    graph = build_graph()
+    state = {"question": prompt, "organism": org}
+    result = graph.invoke(state)
+    st.markdown("### 🧠 LLM Answer")
+    st.success(result["response"])
 
-    result = graph.invoke({"question": question, "organism": organism})
-    print("\nAnswer:\n")
-    print(result["response"])
-
-- add recursivecharactertext splitter to split documents
-	- textsplitter
-- then embed contents of each split and insert into vector store: vector_store
-- Lang graph?
-
+    st.markdown("### 🔍 Posterior Probability Plots")
+    ids = [k for k in index.describe_index_stats()["namespaces"].get("", {}) if org in k]
+    if ids:
+        results = index.fetch(ids=ids)
+        for k, v in results.items():
+            metadata = v["metadata"]
+            if metadata.get("organism") == org:
+                posterior = decode_posterior(metadata["posterior_compressed"])
+                kozak_probs = [p[0] for p in posterior]
+                plt.figure(figsize=(8, 2))
+                plt.plot(kozak_probs, label=f"{k}")
+                plt.title(f"{k}")
+                plt.xlabel("Position")
+                plt.ylabel("P(Kozak)")
+                plt.ylim(0, 1)
+                plt.legend()
+                st.pyplot(plt)
